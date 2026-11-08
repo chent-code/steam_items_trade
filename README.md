@@ -76,6 +76,12 @@ steam_items_trade/
 | `undercut_pct` | 1.0 | 插队幅度%(对他人最低价) |
 | `buy_max_per_item` | 3 | 单品种最多买入件数(挂单簿达标档位数) |
 | `buy_scan_enable` / `buy_scan_pages` | true / 8 | 调度内收购扫描开关与页数 |
+| `exit_check_enable` | true | 出口评估开关(三场地×挂/砸比较推送) |
+| `buff_sell_fee` | 0.015 | BUFF 卖家费率 |
+| `exit_edge_min` | 0.2 | 砸单比挂单优多少元才提醒 |
+| `exit_notify_hours` | 12 | 同一物品出口提醒冷却 |
+| `buff_dump_gate` | 1.02 | BUFF卖一≤UUYP卖一×此值才查求购簿 |
+| `spread_warn` | 0.88 | 买一/卖一低于此判定卖一虚高(UUYP/BUFF) |
 
 ## 核心口径
 
@@ -84,6 +90,14 @@ steam_items_trade/
 - **比值(成交)** = 场地卖一 ÷ (Steam近7日成交量加权均价 × 0.8696)；推送主排序，★=<0.70 硬机会，⚠=>0.75 谨慎
 - **卖侧改价参考** = UUYP 实时挂单簿的**他人最低价**（UserId 排除自己；csqaq 快照有滞后幽灵价，禁止用于触发动作）
 - **策略底线**：资产不允许可交易空窗——灰色带(0.70~0.75)不下架只提醒，催出而非观望
+- **出口评估**（三场地 × 挂卖一/丢买一，每轮推送「最优出口提醒」）：
+  - 到手 = 价 × 费率（UUYP 0.99 / BUFF 0.985 / Steam 0.8696），场地按到手价比较
+  - **挂卖一 vs 丢买一** 由成交与买一的贴近度判定：Steam 用 成交价7（唯一真实成交数据）；
+    UUYP/BUFF 无成交数据，用 买一/卖一 比价代理（<0.88 = 卖一虚高）
+  - 卖一虚高 → 贴成交价挂（Steam 锚点=成交价7）或直接丢买一——防"僵尸卖一慢慢阴跌，
+    几天后还不如当初砸买一"
+  - **双挂等净**：BUFF挂价 = UUYP挂价 × 1.0051，两边到手一分不差、买家曝光翻倍
+  - BUFF 求购价按需深查（gate+缓存+限量）；Steam 无求购数据（暂缺）
 
 ## 数据源与限速备忘
 
@@ -104,8 +118,9 @@ steam_items_trade/
 ## Roadmap（未定稿，按优先级）
 
 1. **Phase A**：Steam 侧自动化（接报价/发报价/手机确认自动化/发货前自动撤 Steam 卖单）——蓝图见 `docs/research/Steam侧发货自动化调研` 与 `docs/reference/steampy`
-2. **Steam cookie 双令牌自动续期**（steamRefresh 或 store 域长令牌，探索中）
-3. **阴跌防护 v2**：pricehistory 7 日斜率 × 预期持有期 vs 毛利(成交) 的量化过滤
-4. **个人成交数据回归**：记录每次买入的实际脱手天数，回校 min_turnover / min_bid_ask
-5. **BUFF 自动购买**（需 Steam 确认联动，依赖 Phase A/B）
-6. `tests/` 单测补齐：口径计算、形态分类、流动性过滤
+2. **出口评估自动化**：目前三场地比较是推送+人工执行；后续接 BUFF 挂单/砸单 API（cookie 已具备），Steam 端依赖 Phase A
+3. **Steam cookie 双令牌自动续期**（steamRefresh 或 store 域长令牌，探索中）
+4. **阴跌防护 v2**：pricehistory 7 日斜率 × 预期持有期 vs 毛利(成交) 的量化过滤
+5. **个人成交数据回归**：记录每次买入的实际脱手天数，回校 min_turnover / min_bid_ask / spread_warn
+6. **BUFF 自动购买**（需 Steam 确认联动，依赖 Phase A/B）
+7. `tests/` 单测补齐：口径计算、形态分类、流动性过滤、出口评估的锚点逻辑

@@ -12,6 +12,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import sys
@@ -568,6 +569,190 @@ def push_buy_hits(cfg, hits):
     notify(cfg, title, text)
 
 
+def exit_check(cfg, rows, listings, state, dry, now):
+    """三场地(UUYP/BUFF/Steam) × 双模式(挂卖一/丢买一) 出口比较(只提醒不动资产)
+
+    用户模型(2026-11-08 定稿):
+    - 挂卖一的缺陷 = 僵尸价风险:没人抬就随行阴跌,几天后卖一不如当初直接丢买一——三边同构
+    - 判定"卖一是否虚高"看成交与买一的贴近度:
+        Steam:  卖一 vs 成交价7(pricehistory,唯一有真实成交数据的场地)
+        UUYP/BUFF: 无成交价数据 → 用 买一/卖一 比价代理(贴=双边活跃,卖一是真的;
+                   远=成交靠卖家砸单,卖一是假的)
+    - 虚高时:要么挂贴成交价的卖一(anchor 下调),要么直接丢买一
+    - 场地选择按到手价比较(挂刀比例本质);费率:UUYP 1% / BUFF 1.5% / Steam 15.04%
+
+    数据与限速:csqaq 批量卖价每轮 1 次;UUYP 买一主循环已取(row["yyyp_bid"]);
+    BUFF 求购簿按需(gate + goods_id 磁盘缓存 + 每轮限量 8);Steam 成交价7 只在
+    Steam 挂单具有竞争力且缺数据时补拉(每轮限量 4)
+    跳过 steam_gray/steam_suggest 物品(转Steam提醒已覆盖,其行内附 UUYP 砸单选项)"""
+    fee_u = 1 - cfg.get("sell_fee", 0.01)        # UUYP 卖家净得系数
+    fee_b = 1 - cfg.get("buff_sell_fee", 0.015)  # BUFF 卖家净得系数
+    bal_m = cfg.get("net_multiplier", 0.8696)    # Steam 到手系数
+    edge_min = cfg.get("exit_edge_min", cfg.get("buff_edge_min", 0.2))  # 换通道优势阈值(元)
+    notify_hours = cfg.get("exit_notify_hours", 12)
+    spread_th = cfg.get("spread_warn", 0.88)     # 买一/卖一低于此 = 卖一虚高(UUYP/BUFF)
+    if not cfg.get("exit_check_enable", True):
+        return []
+
+    # 按名聚合持有(同名多件合并;记录挂单价与买一价)
+    byname = {}
+    for row in rows:
+        nm = row.get("name")
+        if not nm:
+            continue
+        rec = byname.setdefault(nm, {"cn": row.get("cn") or nm, "qty": 0,
+                                     "listed_min": None, "yyyp_bid": None,
+                                     "steam_ref": None, "asset_ids": []})
+        rec["qty"] += 1
+        rec["asset_ids"].append(row.get("asset_id", ""))
+        if row.get("asset_id") in listings:
+            try:
+                p = float(str(listings[row["asset_id"]]["price"]).replace("¥", ""))
+                rec["listed_min"] = p if rec["listed_min"] is None else min(rec["listed_min"], p)
+            except (TypeError, ValueError):
+                pass
+        for k in ("yyyp_bid", "steam_ref"):
+            v = row.get(k)
+            if v and not rec[k]:
+                rec[k] = float(v)
+    # 跳过已走 Steam 出口通道的物品(转Steam提醒覆盖,避免重复轰炸)
+    for nm in list(byname):
+        if any(state.get(sid, {}).get("state") in ("steam_gray", "steam_suggest")
+               for sid in byname[nm]["asset_ids"]):
+            del byname[nm]
+    if not byname:
+        return []
+
+    # csqaq 批量卖价(每轮 1 次调用,BUFF/Steam 卖一快照)
+    price_map = {}
+    names = list(byname)
+    try:
+        for i in range(0, len(names), 40):
+            r = http_json("POST", CSQAQ + "/goods/getPriceByMarketHashName",
+                          cfg["csqaq_token"], {"marketHashNameList": names[i:i + 40]})
+            ok = (r.get("data") or {}).get("success") or {}
+            for _, o in (ok.items() if isinstance(ok, dict) else []):
+                if o.get("marketHashName"):
+                    price_map[o["marketHashName"]] = o
+    except Exception as e:  # noqa
+        log(cfg, f"出口评估: csqaq 批量价失败 {str(e)[:60]}")
+        return []
+
+    buff_calls, deal_calls = 0, 0
+    cookie = None
+    hits = []
+    for nm, rec in byname.items():
+        o = price_map.get(nm)
+        if not o:
+            continue
+        try:
+            buff_ask = float(o.get("buffSellPrice") or 0)
+            yyyp_ask = float(o.get("yyypSellPrice") or 0)
+            steam_ask = rec["steam_ref"] or float(o.get("steamSellPrice") or 0)
+        except (TypeError, ValueError):
+            continue
+        if yyyp_ask <= 0:
+            continue
+
+        # ---- UUYP 通道 ----
+        ref_price = rec["listed_min"] or round(yyyp_ask * (1 - cfg.get("undercut_pct", 1.0) / 100.0), 2)
+        uuyp_bid = rec["yyyp_bid"]
+        if uuyp_bid and ref_price > 0:
+            uuyp_tight = (uuyp_bid / ref_price) >= spread_th
+            # 虚高 → 锚点下调到贴买一(买一×1.03);否则卖一是真的
+            uuyp_anchor = ref_price if uuyp_tight else max(uuyp_bid * 1.03, 0.01)
+        else:
+            uuyp_tight, uuyp_anchor = True, ref_price
+        uuyp_list = uuyp_anchor * fee_u
+        uuyp_dump = round(uuyp_bid * fee_u, 2) if uuyp_bid else None
+
+        # ---- BUFF 通道(卖一为 csqaq 快照;买一按需深查) ----
+        buff_list = round(buff_ask * fee_b, 2) if buff_ask else None
+        buff_bid, buff_dump = None, None
+        last = state.get("exitnote_" + nm) or {}
+        cooled = time.time() - last.get("ts", 0) < notify_hours * 3600
+        if buff_ask and buff_ask <= yyyp_ask * cfg.get("buff_dump_gate", 1.02) \
+                and buff_calls < 8 and not cooled:
+            from auto_buy_test import buff_goods_id as _bgid, buff_buy_orders as _bbo
+            gid = _bgid(cfg, nm)
+            if gid:
+                buff_calls += 1
+                buff_bid = _bbo(cfg, gid)
+                if buff_bid:
+                    buff_dump = round(buff_bid * fee_b, 2)
+
+        # ---- Steam 通道(卖一实时;成交价7 判虚高并作锚点) ----
+        deal7, steam_spike = None, False
+        steam_list = (steam_ask * bal_m) if steam_ask else None
+        if steam_ask and deal_calls < 4 and steam_list and uuyp_list \
+                and steam_list >= max(uuyp_list, buff_list or 0) * 0.9:
+            # Steam 挂单有竞争力时才值得花 3.5s 拉成交价
+            if cookie is None:
+                try:
+                    from auto_buy_test import steam_cookie as _sc
+                    cookie = _sc(cfg) or ""
+                except Exception:  # noqa
+                    cookie = ""
+            if cookie:
+                from auto_buy_test import steam_pricehistory as _sph
+                deal7 = _sph(cookie, nm)
+                deal_calls += 1
+                time.sleep(3.5)
+        if deal7 and steam_ask and steam_ask > deal7 * 1.10:
+            steam_spike = True
+            steam_list = round(deal7 * bal_m, 2)  # 锚点下调:贴成交价挂
+
+        # ---- 汇总:最优挂单场地 vs 最优即时通道 ----
+        list_opts = [(v, n, p) for v, n, p in
+                     [("UUYP", uuyp_list, ref_price), ("BUFF", buff_list, buff_ask),
+                      ("Steam", steam_list, steam_ask)] if n]
+        best_list = max(list_opts, key=lambda x: x[1]) if list_opts else None
+        dump_opts = [(v, n) for v, n in [("UUYP", uuyp_dump), ("BUFF", buff_dump)] if n]
+        best_dump = max(dump_opts, key=lambda x: x[1]) if dump_opts else None
+
+        # 推送门槛:有行动建议,或双挂可行(均带 12h 冷却)
+        dual_ok = buff_ask >= yyyp_ask * 0.97
+        action = None
+        if best_dump and best_list and best_dump[1] >= best_list[1] - 0.1:
+            action = f"丢买一:{best_dump[0]} 到手 {best_dump[1]:.2f}(即时,免阴跌)"
+        elif best_dump and best_dump[1] >= uuyp_list + edge_min:
+            action = f"可砸{best_dump[0]}求购:到手 {best_dump[1]:.2f} (+{best_dump[1] - uuyp_list:.2f} vs UUYP挂单)"
+        if steam_spike and best_list and best_list[0] == "Steam":
+            spike_act = f"Steam卖一虚高(挂{steam_ask} vs 成交{deal7}) → 贴成交挂 ≤{deal7}(到手 {steam_list:.2f})"
+            action = f"{spike_act};或{action}" if action else spike_act
+        if not action and not dual_ok:
+            state.setdefault("exitnote_" + nm, {"ts": time.time()})
+            continue
+        if cooled:
+            continue  # 12h 内已提醒过
+        lines = [f"· {trunc(rec['cn'], 40)} ×{rec['qty']}"]
+        ch = "挂单" if rec["listed_min"] else "可挂"
+        lines.append(f"  UUYP{ch} {ref_price:.2f}→到手 {uuyp_list:.2f}"
+                     + (f" | 砸买一 {uuyp_dump:.2f}" if uuyp_dump else ""))
+        if buff_ask:
+            lines.append(f"  BUFF卖一 {buff_ask}≈→到手 {buff_list:.2f}"
+                         + (f" | 砸求购 {buff_dump:.2f}" if buff_dump else "")
+                         + (f" | 双挂 ¥{math.ceil(ref_price * fee_u / fee_b * 100) / 100:.2f}(等净)" if dual_ok else ""))
+        if deal7:
+            lines.append(f"  Steam卖一 {steam_ask} | 成交7 {deal7}"
+                         + ("(卖一虚高,贴成交挂)" if steam_spike else ""))
+        if action:
+            lines.append(f"  ▶ {action}")
+        state["exitnote_" + nm] = {"ts": time.time(), "edge": (best_dump or (0, 0))[1]}
+        hits.append("\n".join(lines))
+    if hits:
+        hdr = (f"到手=价×费率(UUYP {fee_u:.2f}/BUFF {fee_b:.3f}/Steam {bal_m:.4f}) | "
+               f"虚高判定:买一/卖一<{spread_th} 或 卖一>成交7×1.10\n"
+               f"卖一虚高→贴成交价挂或直接丢买一 | BUFF执行链:UUYP提取→Steam库存→BUFF\n")
+        if not dry:
+            notify(cfg, "最优出口提醒", hdr + "\n".join(hits))
+        log(cfg, f"出口评估: {len(hits)} 项已推送")
+    else:
+        log(cfg, f"出口评估: {len(byname)} 项,无提醒")
+    return hits
+
+
+
 def cmd_auto(cfg, uu, rows, dry):
     acc = cfg.get("accept_ratio", 0.80)
     sat = cfg.get("satisfy_ratio", 0.70)
@@ -659,12 +844,14 @@ def cmd_auto(cfg, uu, rows, dry):
         else:
             eff_yyyp = mkt
             r_eff = r
-        row["steam_ref"] = steam_ref   # 转Steam提醒用(实时 Steam 卖一)
-        row["eff_yyyp"] = eff_yyyp     # 转Steam提醒用(实时 UUYP 可挂价)
+        row["steam_ref"] = steam_ref   # 出口评估用(实时 Steam 卖一)
+        row["eff_yyyp"] = eff_yyyp     # 出口评估用(实时 UUYP 可挂价)
+        row["yyyp_bid"] = None         # UUYP 买一(出口评估用,下方填充)
 
         supply_p = None
         if eff_yyyp:
             bid = yyyp_bid(cfg, row.get("good_id"))
+            row["yyyp_bid"] = bid      # csqaq 7日买价曲线最新点
             if bid and 0 < bid < eff_yyyp:
                 supply_p = round(bid, 2)
         target = (eff_yyyp if others_min is not None
@@ -760,6 +947,12 @@ def cmd_auto(cfg, uu, rows, dry):
                     else:
                         state.pop(sid_, None)
 
+    # ---- Phase 2.5: 出口评估(三场地×挂/砸,只提醒不动资产;state 变更随 Phase 3 落盘) ----
+    try:
+        exit_check(cfg, rows, listings, state, dry, now)
+    except Exception as e:  # noqa
+        log(cfg, f"出口评估异常: {str(e)[:80]}")
+
     # ---- Phase 3: 通知与存档 ----
     # 转Steam提醒(事件型推送,不受 push_dispatch 开关控制):
     # 灰色带=双边都可出、尽快出为上策; <0.70 已自动下架
@@ -784,9 +977,14 @@ def cmd_auto(cfg, uu, rows, dry):
             deal = row.get("deal7")
             yyyp_v = row.get("eff_yyyp") or row.get("yyyp") or row.get("yyyp_ask") or "?"
             steam_v = row.get("steam_ref") or row.get("steam") or "?"
+            extra = ""
+            yb = row.get("yyyp_bid")
+            if yb:
+                # UUYP 砸买一也是即时出口,有时比挂 Steam 更快更优
+                extra = f" | UUYP砸买一到手 {round(float(yb) * net_m, 2):.2f}"
             lines.append(
                 f"· {trunc(row.get('cn') or row['name'], 40)}  比值 {r:.3f} → {act}\n"
-                f"  UUYP卖一 {yyyp_v} | Steam卖一 {steam_v}{_steam_spike(steam_v, deal)} | 成交7 {deal if deal else '-'}")
+                f"  UUYP卖一 {yyyp_v} | Steam卖一 {steam_v}{_steam_spike(steam_v, deal)} | 成交7 {deal if deal else '-'}{extra}")
         if not dry:
             notify(cfg, "转 Steam 提醒", f"价格快照 {now},以当时为准\n\n" + "\n".join(lines))
         log(cfg, f"转Steam提醒: 灰色带 {len(gray)} 件,已下架 {len(delisted)} 件")

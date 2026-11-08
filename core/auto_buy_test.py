@@ -344,6 +344,85 @@ def buff_sell_order(cfg, goods_id):
         return None
 
 
+def _buff_ids_cache():
+    p = os.path.join(HERE, "buff_goods_ids.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa
+        return {}
+
+
+def buff_goods_id(cfg, market_hash_name):
+    """名称 → BUFF goods_id(磁盘缓存 data/buff_goods_ids.json,每名只搜一次)"""
+    cache = _buff_ids_cache()
+    if market_hash_name in cache:
+        return cache[market_hash_name]
+    ck = buff_session(cfg)
+    if not ck:
+        return None
+    try:
+        r = requests.get("https://api.buff.163.com/api/market/goods",
+                         params={"game": "csgo", "page_num": 1, "page_size": 10,
+                                 "keyword": market_hash_name},
+                         headers={"Cookie": f"session={ck}", "User-Agent": _STEAM_UA},
+                         timeout=20)
+        time.sleep(2)  # BUFF 风控较严,统一 2s 间隔
+        if r.status_code != 200:
+            log(f"[buff] 搜索 HTTP {r.status_code}: {market_hash_name[:30]}")
+            return None
+        d = r.json()
+        if d.get("code") not in (200, "200"):
+            log(f"[buff] 搜索响应异常: {str(d.get('error'))[:60]}")
+            return None
+        for it in (d.get("data") or {}).get("items") or []:
+            if it.get("market_hash_name") == market_hash_name and it.get("id"):
+                cache[market_hash_name] = it["id"]
+                try:
+                    with open(os.path.join(HERE, "buff_goods_ids.json"), "w", encoding="utf-8") as f:
+                        json.dump(cache, f, ensure_ascii=False)
+                except Exception:  # noqa
+                    pass
+                return it["id"]
+        log(f"[buff] 搜索无精确匹配: {market_hash_name[:36]}")
+    except Exception as e:  # noqa
+        log(f"[buff] 搜索异常: {str(e)[:60]}")
+    return None
+
+
+def buff_buy_orders(cfg, goods_id):
+    """BUFF 求购簿最高买一价 | None(无cookie/失败)"""
+    if not goods_id:
+        return None
+    ck = buff_session(cfg)
+    if not ck:
+        return None
+    try:
+        r = requests.get("https://api.buff.163.com/api/market/goods/buy_order",
+                         params={"game": "csgo", "page_num": 1, "page_size": 5,
+                                 "goods_id": goods_id},
+                         headers={"Cookie": f"session={ck}", "User-Agent": _STEAM_UA},
+                         timeout=20)
+        time.sleep(2)
+        if r.status_code != 200:
+            log(f"[buff] buy_order HTTP {r.status_code}: goods {goods_id}")
+            return None
+        d = r.json()
+        if d.get("code") not in (200, "200"):
+            log(f"[buff] 求购簿响应异常: {str(d.get('error'))[:60]}")
+            return None
+        prices = []
+        for i in (d.get("data") or {}).get("items") or []:
+            try:
+                prices.append(float(i.get("price")))
+            except (TypeError, ValueError):
+                pass
+        return round(max(prices), 2) if prices else None
+    except Exception as e:  # noqa
+        log(f"[buff] buy_order 异常: {str(e)[:60]}")
+        return None
+
+
 def _steam_save_cookie(new_ck):
     """新访问令牌落盘(保留第 2 行刷新令牌) + 更新进程内值,返回 True=发生了续期"""
     cookie_path = os.path.join(HERE, "steam_cookie.txt")
