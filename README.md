@@ -1,4 +1,4 @@
-# steam_id_trade
+# steam_items_trade
 
 CS2 饰品「倒余额」半自动交易系统：**UUYP/BUFF 低价买入 → Steam 高价卖出**，围绕这一核心做两条自动化链路：
 
@@ -10,7 +10,7 @@ CS2 饰品「倒余额」半自动交易系统：**UUYP/BUFF 低价买入 → St
 ## 目录结构
 
 ```
-steam_id_trade/
+steam_items_trade/
 ├── core/                  # 公共 Python 模块(跨平台,所有业务逻辑)
 │   ├── paths.py           #   运行时路径唯一来源(data/config/logs/reports)
 │   ├── uu_auth.py         #   UUYP 客户端:登录/风控指纹/API 封装
@@ -49,7 +49,7 @@ steam_id_trade/
 4. 手动试跑: scripts\windows\UUYP_buy_scan.bat
 5. 建计划任务(每 10 分钟):
    schtasks /create /tn "UUYP_auto" /sc minute /mo 10 ^
-     /tr "C:\path\to\steam_id_trade\scripts\windows\UUYP_auto.bat"
+     /tr "C:\path\to\steam_items_trade\scripts\windows\UUYP_auto.bat"
 ```
 
 ### Linux

@@ -2,7 +2,7 @@
 rem ============================================================
 rem 10 分钟调度入口:库存调度 + 待发货检测 + 收购扫描推送
 rem 用法: 由 Windows 计划任务每 10 分钟调用本脚本
-rem   schtasks /create /tn "UUYP_auto" /tr "C:\path\to\steam_id_trade\scripts\windows\UUYP_auto.bat" /sc minute /mo 10
+rem   schtasks /create /tn "UUYP_auto" /tr "C:\path\to\steam_items_trade\scripts\windows\UUYP_auto.bat" /sc minute /mo 10
 rem ============================================================
 cd /d "%~dp0..\..\core"
 
