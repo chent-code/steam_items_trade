@@ -509,8 +509,8 @@ def check_deliver(cfg, uu):
 
 def push_buy_hits(cfg, hits):
     """收购扫描命中 → 微信推送对齐表格(仅新标的,冷却去重后天然增量)
-    主口径:比值(成交)=UUYP卖一÷(成交价7×0.8696) —— 现实退出基准;
-    比值(卖价)仅作参考(卖一是乐观上限)。比值(成交)>0.75 标⚠"""
+    主口径 比值(修正)=成本÷[min(成交价7,尖峰回落基准)×(1−周跌幅×持有周数)×0.8696]
+    即把预期持有期阴跌 + 尖峰回落都从退出基准扣掉,防"比值虚高最后亏损" """
     if not hits:
         return
 
@@ -523,32 +523,46 @@ def push_buy_hits(cfg, hits):
 
     for c in hits:
         c["ratio_deal"] = r_deal(c)
-    hits = sorted(hits, key=lambda x: (x["ratio_deal"] if x["ratio_deal"] is not None
-                                       else x["fresh_ratio"] + 1))  # 无成交价的排后面
+        c.setdefault("ratio_signal", c["ratio_deal"])
+        # 无信号时兜底按成交口径(旧版数据兼容)
+    # 排序按修正口径(主决策),缺失的排后面
+    hits = sorted(hits, key=lambda x: (x["ratio_signal"] if x.get("ratio_signal") is not None
+                                       else (x["ratio_deal"] if x["ratio_deal"] is not None
+                                             else x["fresh_ratio"]) + 1))
 
-    headers = ["比值(成交)", "场地", "求购比", "UUYP卖一", "BUFF卖一", "Steam卖一", "成交价7", "毛利(成交)", "形态", "品种"]
-    aligns = ["r", "l", "r", "r", "r", "r", "r", "r", "l", "l"]
+    headers = ["比值(修正)", "跌/周", "比值(成交)", "场地", "求购比", "UUYP卖一", "BUFF卖一",
+               "Steam卖一", "成交价7", "毛利(修正)", "形态", "品种"]
+    aligns = ["r", "r", "r", "l", "r", "r", "r", "r", "r", "r", "l", "l"]
     cells = []
-    any70 = False
+    any70, any_spike = False, False
     for c in hits:
         d = c.get("deal7")
+        rs = c.get("ratio_signal")
         rd = c["ratio_deal"]
-        # 行标记:★=成交口径<0.70 硬机会 | ⚠=>0.75 谨慎
-        if rd is None:
+        # 行标记:★=修正口径<0.70 硬机会 | ⚠=>0.75 谨慎 | 尖=尖峰按回落基准估值
+        if rs is None:
             mark = "⚠"
-        elif rd < 0.70:
+        elif rs < 0.70:
             mark, any70 = "★", True
-        elif rd > 0.75:
+        elif rs > 0.75:
             mark = "⚠"
         else:
             mark = ""
-        gp = round(float(d) * 0.8696 - c["fresh_ask"], 2) if d else None
+        if c.get("spike"):
+            mark += "尖"
+            any_spike = True
+        exp = c.get("exit_expected")
+        gp = round(float(exp) * 0.8696 - c["fresh_ask"], 2) if exp else None
         venue_txt = c.get("venue", "UUYP") + ("≈" if c.get("snap") else "")
         if c.get("qty") and c["qty"] > 1:
             venue_txt += f"×{c['qty']}"
         disp = c.get("cn_name") or c["name"]  # 中文名优先(csqaq name 字段)
         ba = c.get("bid_ask")
-        cells.append([f"{rd:.3f}{mark}" if rd is not None else "-",
+        dec = (c.get("trend") or {}).get("weekly_decay")
+        cls = c["curve"]["cls"] + ("·尖峰" if c.get("spike") else "")
+        cells.append([f"{rs:.3f}{mark}" if rs is not None else "-",
+                      (f"{dec:.2f}%" if dec is not None else "-"),
+                      (f"{rd:.3f}" if rd is not None else "-"),
                       venue_txt,
                       (f"{ba:.2f}" if ba is not None else "-"),
                       str(c.get("yyyp_ask") or c.get("fresh_ask") or "-"),
@@ -556,15 +570,16 @@ def push_buy_hits(cfg, hits):
                       str(c.get("steam_sell") or "-"),
                       (f"{d:.2f}" if d else "-"),
                       (f"+{gp:.2f}" if gp is not None else "-"),
-                      trunc(c["curve"]["cls"], 16), trunc(disp, 40)])
+                      trunc(cls, 16), trunc(disp, 40)])
     tbl = "\n".join(fmt_table(headers, cells, aligns))
     total = sum((c["fresh_ask"] or 0) * (c.get("qty") or 1) for c in hits)
     title = "收购扫描命中" + ("【含<0.70★】" if any70 else "")
     text = (f"新命中 {len(hits)} 件/可买 {sum(c.get('qty') or 1 for c in hits)} 件 | 全买需 ¥{total:.0f}\n"
-            f"比值(成交)=场地卖一÷(成交价7×0.8696) 现实基准\n"
-            f"★=成交口径<0.70 优先看 | ⚠=>0.75或无成交价 | BUFF≈=快照价\n"
-            f"求购比=Steam买一÷卖一,越高越好(<0.85已过滤):低=成交靠砸单,挂卖慢\n"
-            f"买前核对形态:尖峰·回落中慎入\n\n{tbl}")
+            f"比值(修正)=成本÷[退出基准×(1−周跌幅×持有周数)×0.8696] 最终决策\n"
+            f"退出基准=min(成交价7,尖峰回落基准);尖=短期急涨按回落基准估值\n"
+            f"★=修正口径<0.70 优先看 | ⚠=>0.75或数据缺失 | 跌/周=180天稳健斜率\n"
+            f"求购比=Steam买一÷卖一(<0.85已过滤) | BUFF≈=快照价"
+            + ("\n本轮含尖峰标的,已按回落基准折算" if any_spike else "") + f"\n\n{tbl}")
     log(cfg, f"收购扫描命中 {len(hits)} 件,已推送" + ("(含<0.70★)" if any70 else ""))
     notify(cfg, title, text)
 

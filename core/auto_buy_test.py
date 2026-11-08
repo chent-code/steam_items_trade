@@ -162,6 +162,99 @@ def scan_candidates(cfg, pages):
     return out, scanned
 
 
+def chart_pairs(cfg, good_id, period="180"):
+    """csqaq Steam 卖价曲线 → [(datetime, price)] 升序(180天≈半年/90天≈一季度)"""
+    r = csqaq_post(cfg, "/info/chart", {"good_id": good_id, "key": "sell_price",
+                                        "platform": 3, "period": str(period),
+                                        "style": "all_style"})
+    d = r.get("data") or {}
+    return sorted((datetime.fromtimestamp(t / 1000), float(v))
+                  for t, v in zip(d.get("timestamp") or [], d.get("main_data") or []))
+
+
+def trend_signal(pairs, cfg):
+    """长周期趋势信号(用户策略:把周跌幅和尖峰回落纳入挂刀比例)
+
+    weekly_decay: 周化跌幅%(正=跌)。按 7 日窗口取每周中位价,再用 Theil-Sen
+      (所有点对斜率的中位数)估计斜率——抗单点尖峰,不会把一次暴涨误当趋势
+    spike: 近 7 日中位价相对 8~90 日前基线中位涨幅 ≥ spike_pct → 尖峰回落风险
+    spike_base: 回落基准价(尖峰前的价格中枢,退出估值按它算而不是尖峰值)
+    """
+    out = {"weekly_decay": None, "spike": False, "spike_base": None,
+           "spike_rise": None, "med_long": None}
+    if len(pairs) < 20:
+        return out
+    prices = [float(p) for _, p in pairs if p and p > 0]
+    if len(prices) < 20:
+        return out
+    t0 = pairs[0][0]
+    buckets = {}
+    for dt, p in pairs:
+        if not p or p <= 0:
+            continue
+        w = int((dt - t0).total_seconds() // (7 * 86400))
+        buckets.setdefault(w, []).append(float(p))
+    wmed = sorted((w, statistics.median(v)) for w, v in buckets.items())
+    if len(wmed) >= 4:
+        slopes = []
+        for i in range(len(wmed)):
+            for j in range(i + 1, len(wmed)):
+                dw = wmed[j][0] - wmed[i][0]
+                if dw >= 2 and wmed[i][1] > 0:
+                    slopes.append((wmed[j][1] - wmed[i][1]) / dw / wmed[i][1])
+        if slopes:
+            decay = -statistics.median(slopes) * 100  # %/周,正=下跌
+            out["weekly_decay"] = round(max(0.0, min(decay, cfg.get("decay_cap_pct", 5.0))), 2)
+    last = pairs[-1][0]
+    recent = [float(p) for dt, p in pairs if (last - dt).days <= 7 and p and p > 0]
+    # 尖峰基线 = 紧邻前置平台(7~30 日前),不是长周期中枢——否则"长期下跌后反弹回旧价"会被误判
+    near_pool = [float(p) for dt, p in pairs
+                 if 8 <= (last - dt).days <= cfg.get("spike_base_days", 30) and p and p > 0]
+    long_pool = [float(p) for dt, p in pairs
+                 if 8 <= (last - dt).days <= 90 and p and p > 0]
+    base_pool = near_pool if len(near_pool) >= 5 else long_pool
+    if recent and base_pool:
+        cur = statistics.median(recent)
+        base = statistics.median(base_pool)
+        rise = (cur / base - 1) if base > 0 else 0
+        out["med_long"] = round(statistics.median(long_pool), 2) if long_pool else None
+        out["spike_rise"] = round(rise * 100)
+        if rise >= cfg.get("spike_pct", 0.15):
+            out["spike"] = True
+            # 回落基准:给 5% 容忍(真实重估会保留一点涨幅),但绝不用尖峰值
+            out["spike_base"] = round(min(base * (1 + cfg.get("spike_tolerance", 0.05)), cur), 2)
+    return out
+
+
+def apply_signal(c, cfg):
+    """折算最终决策口径 ratio_signal = 成本 ÷ 修正后退出到手
+
+    修正后退出基准 = min(近7日成交均价或Steam卖一, 尖峰回落基准)
+                    × (1 - 周跌幅 × 预期持有周数)
+    即:预期持有期内的阴跌 + 尖峰回落都从分母扣掉,避免"比值虚高最后亏损"
+    """
+    sig = c.get("trend") or {}
+    d = c.get("deal7")
+    try:
+        base = float(d) if d else float(c.get("steam_sell") or 0)
+    except (TypeError, ValueError):
+        base = 0.0
+    spike = bool(sig.get("spike"))
+    if spike and sig.get("spike_base"):
+        base = min(base, float(sig["spike_base"]))
+    decay = sig.get("weekly_decay")
+    if decay:
+        base *= max(0.5, 1 - decay / 100 * cfg.get("hold_weeks", 1))
+    c["exit_expected"] = round(base, 2) if base else None
+    try:
+        c["ratio_signal"] = (round(c["fresh_ask"] / (base * NET), 3)
+                             if base and c.get("fresh_ask") else None)
+    except (TypeError, ZeroDivisionError, ValueError):
+        c["ratio_signal"] = None
+    c["spike"] = spike
+    return c
+
+
 def classify_curve(pairs, steam_now=None):
     """跳涨形态分类器(用户洞察:重估与尖峰的区别在跳涨后的稳定性)
     pairs: [(datetime, price)] 升序;steam_now: 当前实时价(比曲线末端新)
@@ -634,16 +727,17 @@ def run_once(cfg, uu, pages=8, max_verify=20, cooldown_hours=24):
     with open(state_p, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=1)
 
-    for c in verified:  # 形态分类(Steam 曲线,重估 vs 尖峰)
+    for c in verified:  # 形态分类 + 长周期趋势信号(单次 180 天曲线调用)
         try:
-            r = csqaq_post(cfg, "/info/chart", {"good_id": c["csqaq_id"], "key": "sell_price",
-                                                "platform": 3, "period": "30", "style": "all_style"})
-            d = r.get("data") or {}
-            pairs = sorted((datetime.fromtimestamp(t / 1000), v)
-                           for t, v in zip(d.get("timestamp") or [], d.get("main_data") or []))
-            c["curve"] = classify_curve(pairs, steam_now=c.get("steam_sell"))
+            pairs = chart_pairs(cfg, c["csqaq_id"], cfg.get("decay_window_days", 180))
+            # 形态分类器保持原 30 天语义(近 30 天切片)
+            tail30 = [(dt, p) for dt, p in pairs
+                      if (pairs[-1][0] - dt).days <= 30] if pairs else []
+            c["curve"] = classify_curve(tail30 or pairs, steam_now=c.get("steam_sell"))
+            c["trend"] = trend_signal(pairs, cfg)
         except Exception:  # noqa
             c["curve"] = {"cls": "数据不足", "jump_pct": None, "days": None, "detail": ""}
+            c["trend"] = {"weekly_decay": None, "spike": False, "spike_base": None}
         time.sleep(1.5)
 
     cookie = steam_cookie(cfg)  # 成交价7:买入决策的现实退出基准
@@ -664,6 +758,24 @@ def run_once(cfg, uu, pages=8, max_verify=20, cooldown_hours=24):
             time.sleep(5)
         for c in verified:
             c.setdefault("deal7", None)
+    # 修正口径:把周跌幅×持有期 + 尖峰回落从退出基准扣掉,得到最终决策比值
+    for c in verified:
+        apply_signal(c, cfg)
+    if cfg.get("signal_filter_enable", True) and cfg.get("spike_guard", "reprice") != "warn":
+        sig_max = cfg.get("signal_filter_max", 0.75)
+        guard = cfg.get("spike_guard", "reprice")  # reprice=按回落基准重算 | filter=尖峰全剔 | warn=只标不过滤
+        before = len(verified)
+        kept = []
+        for c in verified:
+            if guard == "filter" and c.get("spike"):
+                continue
+            rs = c.get("ratio_signal")
+            if rs is not None and rs > sig_max:
+                continue  # 修正后性价比不够 → 不推(防"尖峰虚高/阴跌吃掉利润")
+            kept.append(c)
+        if before - len(kept):
+            log(f"修正口径过滤: 剔除 {before - len(kept)}/{before} 件(比值>{sig_max} 或尖峰)")
+        verified = kept
     # cookie 失效且刷新也失败 → 微信推送提醒(每轮失效期只提醒一次,续期成功自动解除)
     if cookie and _STEAM_COOKIE.get("expired") and not state.get("steam_cookie_expired"):
         state["steam_cookie_expired"] = True
@@ -755,17 +867,17 @@ def main():
     # CSV
 
 
-    # Steam 曲线形态分类(重估 vs 尖峰,替代 7 日中位法)
+    # Steam 曲线形态分类 + 长周期趋势信号(单次 180 天曲线调用)
     for c in verified:
         try:
-            r = csqaq_post(cfg, "/info/chart", {"good_id": c["csqaq_id"], "key": "sell_price",
-                                                "platform": 3, "period": "30", "style": "all_style"})
-            d = r.get("data") or {}
-            pairs = sorted((datetime.fromtimestamp(t / 1000), v)
-                           for t, v in zip(d.get("timestamp") or [], d.get("main_data") or []))
-            c["curve"] = classify_curve(pairs, steam_now=c.get("steam_sell"))
+            pairs = chart_pairs(cfg, c["csqaq_id"], cfg.get("decay_window_days", 180))
+            tail30 = [(dt, p) for dt, p in pairs
+                      if (pairs[-1][0] - dt).days <= 30] if pairs else []
+            c["curve"] = classify_curve(tail30 or pairs, steam_now=c.get("steam_sell"))
+            c["trend"] = trend_signal(pairs, cfg)
         except Exception as e:  # noqa
             c["curve"] = {"cls": "数据不足", "jump_pct": None, "days": None, "detail": str(e)[:40]}
+            c["trend"] = {"weekly_decay": None, "spike": False, "spike_base": None}
         time.sleep(1.5)
 
     # Steam 真实成交价(近7日成交量加权均值,pricehistory 需 cookie)
@@ -779,40 +891,48 @@ def main():
     else:
         for c in verified:
             c["deal7"] = None
+    # 独立脚本也用同一修正口径(展示与调度一致),不做过滤(调试要看全量)
+    for c in verified:
+        apply_signal(c, cfg)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
     os.makedirs(REPORT_DIR, exist_ok=True)
     csv_path = os.path.join(REPORT_DIR, f"buy_scan_{stamp}.csv")
 
     # 控制台报告(等宽对齐)
-    headers = ["比值(买)", "场地", "求购比", "UUYP卖一", "BUFF卖一", "Steam卖一",
-               "成交价7", "毛利(成交)", "毛利(卖一)", "形态", "品种"]
-    aligns = ["r", "l", "r", "r", "r", "r", "r", "r", "r", "l", "l"]
+    headers = ["比值(修正)", "跌/周", "比值(买)", "场地", "求购比", "UUYP卖一", "BUFF卖一",
+               "Steam卖一", "成交价7", "毛利(修正)", "形态", "品种"]
+    aligns = ["r", "r", "r", "l", "r", "r", "r", "r", "r", "r", "l", "l"]
     cells = []
     for c in verified:
         ask = c["fresh_ask"]
         deal = c.get("deal7")
-        p_deal = round(deal * NET - ask, 2) if deal else None  # 现实基准:近7日真实成交
-        p_sell = round(float(c["steam_sell"]) * NET - ask, 2)  # 乐观:挂卖等到买家
+        exp = c.get("exit_expected")
+        p_fix = round(float(exp) * NET - ask, 2) if exp else None  # 修正后退出基准的毛利
         venue = c.get("venue", "UUYP")
         venue_txt = venue + ("≈" if c.get("snap") else "")
         if c.get("qty") and c["qty"] > 1:
             venue_txt += f"×{c['qty']}"
         ba = c.get("bid_ask")
-        cells.append([str(c["fresh_ratio"]), venue_txt,
+        dec = (c.get("trend") or {}).get("weekly_decay")
+        rs = c.get("ratio_signal")
+        rtxt = (f"{rs:.3f}" + ("尖" if c.get("spike") else "")) if rs is not None else "-"
+        cls = c["curve"]["cls"] + ("·尖峰" if c.get("spike") else "")
+        cells.append([rtxt,
+                      (f"{dec:.2f}%" if dec is not None else "-"),
+                      str(c["fresh_ratio"]), venue_txt,
                       (f"{ba:.2f}" if ba is not None else "-"),
                       str(c.get("yyyp_ask") or c.get("fresh_ask")), str(c.get("buff_sell") or "-"),
                       str(c["steam_sell"]),
                       (f"{deal:.2f}" if deal else "-"),
-                      (f"{p_deal:.2f}" if p_deal is not None else "-"),
-                      f"{p_sell:.2f}",
-                      trunc(c["curve"]["cls"], 20), trunc(c["name"], 34)])
+                      (f"{p_fix:.2f}" if p_fix is not None else "-"),
+                      trunc(cls, 20), trunc(c["name"], 34)])
     print(f"\n== 确认收购标的({len(verified)} 件) ==")
     for ln in fmt_table(headers, cells, aligns):
         print(ln)
-    print("口径:比值(买)=场地卖一÷(Steam卖一×0.8696),UUYP/BUFF谁便宜算谁 | "
-          "场地带≈=csqaq快照价未实时验证 | "
-          "成交价7=Steam近7日真实成交量加权均价 | 毛利(成交)=成交价7×0.8696−买价")
+    print("口径:比值(修正)=成本÷[min(成交价7/基准,尖峰回落基准)×(1−周跌幅×持有周数)×0.8696] 最终决策 | "
+          "跌/周=180天周中位价 Theil-Sen 稳健斜率 | 尖=短期急涨按回落基准估值 | "
+          "比值(买)=场地卖一÷(Steam卖一×0.8696) 预过滤 | 毛利(修正)=修正退出到手−买价")
     all_rows = cands[:args.max_verify]
     if all_rows:
         with open(csv_path, "w", newline="", encoding="utf-8") as f:

@@ -28,5 +28,15 @@
   "exit_edge_min": 0.2,
   "exit_notify_hours": 12,
   "buff_dump_gate": 1.02,
-  "spread_warn": 0.88
+  "spread_warn": 0.88,
+  "_comment_4": "买侧修正口径:长期周跌幅 + 尖峰回落折算",
+  "decay_window_days": 180,
+  "hold_weeks": 1,
+  "decay_cap_pct": 5.0,
+  "spike_pct": 0.15,
+  "spike_base_days": 30,
+  "spike_tolerance": 0.05,
+  "signal_filter_enable": true,
+  "signal_filter_max": 0.75,
+  "spike_guard": "reprice"
 }
