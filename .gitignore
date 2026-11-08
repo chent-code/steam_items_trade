@@ -1,0 +1,26 @@
+# ===== 密钥与运行时数据(绝不入库) =====
+data/
+*_cookie.txt
+config.json
+config.real.json
+config.tail.json
+*.db
+
+# ===== 日志与报告 =====
+*.log
+logs/
+reports/
+inv_raw/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ===== 系统/编辑器 =====
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

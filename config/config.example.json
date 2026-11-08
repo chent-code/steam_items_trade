@@ -1,0 +1,25 @@
+{
+  "_comment_1": "复制本文件为 data/config.json 并填入真实值(data/ 整体被 gitignore,不会入库)",
+  "uu_token": "在 UUYP App 抓包获取( authorization / Device-Id 相关请求头)",
+  "uu_device_token": "UUYP 设备令牌(可选,登录会话续期用)",
+  "csqaq_token": "csqaq.com API Token(ApiToken 请求头)",
+  "wxpusher": {
+    "app_token": "WxPusher 的 APP_TOKEN(AT_xxx)",
+    "uid": "WxPusher 接收者 UID(UID_xxx)"
+  },
+  "_comment_2": "以下为可选参数,不填走代码内默认值",
+  "accept_ratio": 0.75,
+  "delist_ratio": 0.7,
+  "min_bid_ask": 0.85,
+  "min_turnover": 10,
+  "ratio_max": 0.7,
+  "undercut_pct": 1.0,
+  "buy_max_per_item": 3,
+  "buy_scan_enable": true,
+  "buy_scan_pages": 8,
+  "deal7_max_per_round": 12,
+  "push_dispatch": true,
+  "band": [0.65, 0.7],
+  "min_price": 10,
+  "max_price": 5000
+}

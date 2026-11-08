@@ -1,0 +1,3 @@
+# 每 10 分钟跑一轮调度(库存调度+待发货+收购扫描推送)
+# 用法: crontab -e 后粘贴(把路径换成你的实际部署路径),日志落在 data/logs/
+*/10 * * * * /path/to/steam_id_trade/scripts/linux/uuyp_auto.sh >> /path/to/steam_id_trade/data/logs/cron.log 2>&1
