@@ -46,11 +46,20 @@ steam_items_trade/
 1. 安装 Python 3.10+ 并 pip install -r requirements.txt
 2. copy config\config.example.json data\config.json  → 填入真实 token/uid
 3. cookie 放 data\steam_cookie.txt 与 data\buff_cookie.txt
-4. 手动试跑: scripts\windows\UUYP_buy_scan.bat
-5. 建计划任务(每 10 分钟):
+4. 手动试跑(双击,窗口停留 + 微信回执): scripts\windows\UUYP_auto.bat
+   收购扫描(双击,停留):               scripts\windows\UUYP_buy_scan.bat
+5. 建计划任务(每 10 分钟)——务必用 _task 版(不弹窗、不 pause):
    schtasks /create /tn "UUYP_auto" /sc minute /mo 10 ^
-     /tr "C:\path\to\steam_items_trade\scripts\windows\UUYP_auto.bat"
+     /tr "C:\path\to\steam_items_trade\scripts\windows\UUYP_auto_task.bat"
 ```
+
+**Windows bat 注意事项**（踩过的坑，修改脚本时务必遵守）：
+
+- bat 文件必须是 **CRLF 换行 + 纯 ASCII 内容**。`cmd.exe` 按 GBK 代码页解析，UTF-8 无 BOM 的中文注释会被拆成乱码命令、导致 `cd` 失效、python 在错误目录启动失败并秒退
+- 脚本内 `echo` 不能含未转义的 `|`（会被当管道符）
+- 双击版 `UUYP_auto.bat` 带 `pause` 和「Manual run finished」微信回执；计划任务版 `UUYP_auto_task.bat` 不带（否则任务会挂住等按键）
+- 日志在 `data/logs/`，**按周命名**（`auto_log_<本周一>.txt`，如 `auto_log_2026-11-09.txt`），不是按天——找当天日期的文件会找不到
+- 例行调度默认**不推微信**（`push_dispatch` 未开，避免刷屏）；只有事件型消息才响：待发货订单、收购命中、转 Steam 提醒、出口评估、cookie 失效。双击版额外发一条运行回执便于确认脚本确实跑了
 
 ### Linux
 
