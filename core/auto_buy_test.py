@@ -375,9 +375,23 @@ def _steam_decode_exp(jwt_value):
 
 
 _STEAM_COOKIE = {"v": None, "refresh": None, "exp": 0, "expired": False}
+_STEAM_429 = {"until": 0.0}  # 全局 429 熔断:撞到限频后 5 分钟内不再逐件重试(防每轮耗时爆炸)
 _STEAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 _BUFF_COOKIE = {"v": None}
+_BUFF_FAIL = {"until": 0.0}  # BUFF 域名不可达时全局熔断 5 分钟,避免每轮 7×20s 超时拖死调度
+
+
+def buff_down():
+    """BUFF API 是否处于熔断期"""
+    return time.time() < _BUFF_FAIL["until"]
+
+
+def buff_trip(reason):
+    """标记 BUFF 不可达(5 分钟内不再逐件重试)"""
+    if not buff_down():
+        log(f"[buff] 接口不可达,本轮剩余商品跳过(熔断 5 分钟): {reason[:50]}")
+    _BUFF_FAIL["until"] = time.time() + 300
 
 
 def buff_session(cfg):
@@ -404,7 +418,7 @@ def buff_session(cfg):
 
 def buff_sell_order(cfg, goods_id):
     """BUFF 实时挂单簿 → (最低价, 在售档位数) | None(无cookie/失败/登录失效)"""
-    if not goods_id:
+    if not goods_id or buff_down():
         return None
     ck = buff_session(cfg)
     if not ck:
@@ -433,7 +447,7 @@ def buff_sell_order(cfg, goods_id):
             return None
         return round(min(prices), 2), len(prices)
     except Exception as e:  # noqa
-        log(f"[buff] sell_order 异常: {str(e)[:60]}")
+        buff_trip(f"sell_order: {str(e)[:60]}")
         return None
 
 
@@ -451,6 +465,8 @@ def buff_goods_id(cfg, market_hash_name):
     cache = _buff_ids_cache()
     if market_hash_name in cache:
         return cache[market_hash_name]
+    if buff_down():
+        return None
     ck = buff_session(cfg)
     if not ck:
         return None
@@ -479,13 +495,13 @@ def buff_goods_id(cfg, market_hash_name):
                 return it["id"]
         log(f"[buff] 搜索无精确匹配: {market_hash_name[:36]}")
     except Exception as e:  # noqa
-        log(f"[buff] 搜索异常: {str(e)[:60]}")
+        buff_trip(f"搜索异常: {str(e)[:60]}")
     return None
 
 
 def buff_buy_orders(cfg, goods_id):
     """BUFF 求购簿最高买一价 | None(无cookie/失败)"""
-    if not goods_id:
+    if not goods_id or buff_down():
         return None
     ck = buff_session(cfg)
     if not ck:
@@ -512,7 +528,7 @@ def buff_buy_orders(cfg, goods_id):
                 pass
         return round(max(prices), 2) if prices else None
     except Exception as e:  # noqa
-        log(f"[buff] buy_order 异常: {str(e)[:60]}")
+        buff_trip(f"buy_order: {str(e)[:60]}")
         return None
 
 
@@ -621,6 +637,9 @@ def steam_pricehistory(cookie, market_hash_name):
     cookie = cookie or _STEAM_COOKIE["v"]
     if not cookie:
         return None
+    # 全局熔断:一次限频后本轮剩余商品直接跳过,避免每件都退避 120s 把单轮拖过任务时限
+    if time.time() < _STEAM_429["until"]:
+        return None
     url = (f"https://steamcommunity.com/market/pricehistory/"
            f"?appid=730&market_hash_name={quote(market_hash_name)}")
     headers = {"Cookie": f"steamLoginSecure={cookie}", "User-Agent": _STEAM_UA}
@@ -632,10 +651,12 @@ def steam_pricehistory(cookie, market_hash_name):
             if new_ck and new_ck != cookie:
                 _steam_save_cookie(new_ck)
             if r.status_code == 429:
-                if attempt == 2:
-                    log(f"[steam] pricehistory 429 退避后仍限,放弃: {market_hash_name[:30]}")
-                    return None
+                # 首件撞限频:只退避一次(60s),仍限则全局熔断 5 分钟;后续商品本轮不再拉
                 log(f"[steam] 429 限频,退避 60s 重试({attempt + 1}/2): {market_hash_name[:30]}")
+                if attempt >= 1:
+                    _STEAM_429["until"] = time.time() + 300
+                    log("[steam] 429 持续,本轮剩余商品跳过成交价拉取(全局熔断 5 分钟)")
+                    return None
                 time.sleep(60)
                 continue
             if r.status_code == 302:

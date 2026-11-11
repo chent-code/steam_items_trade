@@ -137,6 +137,8 @@ steam_items_trade/
 | BUFF sell_order | api.buff.163.com | 需 session cookie，2s 间隔 |
 | csqaq | api.csqaq.com | IP 绑定制（30s 限速），只用于买侧发现层 |
 
+**全局熔断（防止单轮被拖死）**：Steam pricehistory 撞 429 后只退避一次，仍限则 5 分钟内本轮剩余商品全部跳过；BUFF 域名不可达时同样熔断 5 分钟（否则每件 20s 超时 ×7 件 + 每件 429 退避 120s，会撞上计划任务 15 分钟执行时限，日志停在中间、后续轮次全部被 IgnoreNew 挡掉）。熔断期回退 csqaq 快照 / 成交价留空，不阻断主流程。
+
 ## 从旧目录(skin-index)迁移
 
 - 新仓库 `data/` 已迁移真实 config/cookie/state，可直接运行
