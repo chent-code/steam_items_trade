@@ -58,8 +58,10 @@ steam_items_trade/
 - bat 文件必须是 **CRLF 换行 + 纯 ASCII 内容**。`cmd.exe` 按 GBK 代码页解析，UTF-8 无 BOM 的中文注释会被拆成乱码命令、导致 `cd` 失效、python 在错误目录启动失败并秒退
 - 脚本内 `echo` 不能含未转义的 `|`（会被当管道符）
 - 双击版 `UUYP_auto.bat` 带 `pause` 和「Manual run finished」微信回执；计划任务版 `UUYP_auto_task.bat` 不带（否则任务会挂住等按键）
-- 日志在 `data/logs/`，**按周命名**（`auto_log_<本周一>.txt`，如 `auto_log_2026-11-09.txt`），不是按天——找当天日期的文件会找不到
+- **计划任务版完全静默**：所有 stdout 重定向到 `data/logs/auto_console.log`，控制台零输出——防止 Windows 控制台「快速编辑模式」选中文字时冻结进程（曾导致单轮挂死 20 小时、后续扫描全部停摆）。计划任务本身也应设为 Hidden + 15 分钟执行时限 + 忽略新实例
+- 日志在 `data/logs/`，**按周命名**（`auto_log_<本周一>.txt`，如 `auto_log_2026-11-09.txt`），不是按天——找当天日期的文件会找不到；计划任务的控制台输出单独在 `auto_console.log`
 - 例行调度默认**不推微信**（`push_dispatch` 未开，避免刷屏）；只有事件型消息才响：待发货订单、收购命中、转 Steam 提醒、出口评估、cookie 失效。双击版额外发一条运行回执便于确认脚本确实跑了
+- 健康自检：`data/logs/auto_log_<周一>.txt` 应每 10 分钟出现一组「轮次开始 … 单轮模式结束」。若只有「轮次开始」没有结束行，说明该轮卡住；用任务计划程序看任务状态或用 `Get-ScheduledTaskInfo` 检查 `LastTaskResult`
 
 ### Linux
 
