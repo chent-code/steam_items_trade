@@ -773,6 +773,8 @@ def cmd_auto(cfg, uu, rows, dry):
     sat = cfg.get("satisfy_ratio", 0.70)
     dlist = cfg.get("delist_ratio", 0.75)  # 已上架物品的下架阈值(滞后带防反复横跳)
     undercut = cfg.get("undercut_pct", 1.0) / 100.0  # 插队幅度:卖一减N%(默认1%)
+    # 观察模式:计划照算,但不上架/不改价/不跟涨/不下架,改为推送"建议动作"由人工执行
+    notify_only = cfg.get("notify_only", False)
     listings = {l["steam_asset_id"]: l for l in uu.get_sell_list()}
     log(cfg, f"在售挂单 {len(listings)} 件")
     state, state_path = load_state(cfg)
@@ -921,7 +923,17 @@ def cmd_auto(cfg, uu, rows, dry):
                 # 灰色带内停留不重复提醒(状态保持 steam_gray)
 
     # ---- Phase 2: 分组执行(每组独立,失败回滚该组状态) ----
-    if not dry:
+    # 观察模式(notify_only):不执行任何资产动作,并回滚 Phase 1 提前写入的"已上架/已下架"状态
+    # ——否则下一轮会误判已处理而不再提醒
+    if notify_only and (plans["list"] or plans["reprice"] or plans["delist"]):
+        for a in actions:
+            if a[0] in ("自动上架", "自动改价", "自动跟涨", "自动下架→转Steam"):
+                if prev_snapshot.get(a[1]):
+                    state[a[1]] = prev_snapshot[a[1]]
+                else:
+                    state.pop(a[1], None)
+        log(cfg, f"观察模式: {len(actions)} 个动作未执行(notify_only=true)")
+    if not dry and not notify_only:
         if plans["delist"]:
             try:
                 uu.off_shelf(plans["delist"])
@@ -988,7 +1000,9 @@ def cmd_auto(cfg, uu, rows, dry):
         lines = []
         for row, r in gray + delisted:
             is_gray = (row, r) in gray
-            act = "建议尽快挂 Steam(挂单暂保留)" if is_gray else "已自动下架,请转 Steam 出售"
+            act = ("建议尽快挂 Steam(挂单暂保留)" if is_gray else
+                   "建议下架转 Steam(观察模式,未执行)" if notify_only else
+                   "已自动下架,请转 Steam 出售")
             deal = row.get("deal7")
             yyyp_v = row.get("eff_yyyp") or row.get("yyyp") or row.get("yyyp_ask") or "?"
             steam_v = row.get("steam_ref") or row.get("steam") or "?"
@@ -1004,16 +1018,29 @@ def cmd_auto(cfg, uu, rows, dry):
             notify(cfg, "转 Steam 提醒", f"价格快照 {now},以当时为准\n\n" + "\n".join(lines))
         log(cfg, f"转Steam提醒: 灰色带 {len(gray)} 件,已下架 {len(delisted)} 件")
     if actions or notes:
-        content = [f"🤖 自动调度 {now}"]
+        # 观察模式:动作只作为"建议"推送,不改资产;签名去重防止每 10 分钟重复轰炸
+        prefix = "仅通知·建议动作(未执行)" if notify_only else "自动调度"
+        content = [f"🤖 {prefix} {now}"]
         for a in actions:
-            content.append(f"[{a[0]}] {a[2][:44]}  比值 {a[3]:.3f}  {a[4]}")
+            tag = ("建议" + a[0].removeprefix("自动")) if notify_only else a[0]
+            content.append(f"[{tag}] {a[2][:44]}  比值 {a[3]:.3f}  {a[4]}")
         content += notes
         text = "\n".join(content)
         print("\n" + text)
         _append_log(text + "\n" + "-" * 50)
-        if not dry and cfg.get("push_dispatch"):
-            # 例行调度默认不推微信(消息太多),仅记日志;需要时在配置加 "push_dispatch": true
-            notify(cfg, "倒余额自动调度", text)
+        if not dry:
+            if notify_only:
+                # 签名 = 动作类型+标的+目标价/原因;内容不变则不重推,价格变了或新动作出现才推
+                sig = "|".join(f"{a[0]}:{a[1]}:{a[4]}" for a in actions)
+                last = state.get("notify_only_digest") or {}
+                if sig == last.get("sig") and time.time() - last.get("ts", 0) < 12 * 3600:
+                    log(cfg, "观察模式: 建议内容未变化,跳过重复推送")
+                elif sig:
+                    notify(cfg, "调度建议(仅通知)", text)
+                    state["notify_only_digest"] = {"sig": sig, "ts": time.time()}
+            elif cfg.get("push_dispatch"):
+                # 例行调度默认不推微信(消息太多),仅记日志;需要时在配置加 "push_dispatch": true
+                notify(cfg, "倒余额自动调度", text)
     else:
         log(cfg, "无状态变化")
     if not dry:
