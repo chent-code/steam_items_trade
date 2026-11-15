@@ -17,8 +17,8 @@ steam_items_trade/
 │   ├── watcher_inv.py     #   10 分钟调度:卖侧决策 + 待发货 + 收购扫描推送入口
 │   └── auto_buy_test.py   #   收购扫描:发现/验证/成交价/独立运行入口
 ├── scripts/
-│   ├── windows/           # Windows 专用(bat,供计划任务调用)
-│   └── linux/             # Linux 专用(sh + crontab 示例 + 部署脚本)
+│   ├── windows/           # Windows 专用:启动/扫描 bat + scheduler.ps1 与 stop/start/status 开关
+│   └── linux/             # Linux 专用:启动/扫描 sh + scheduler.sh 开关 + crontab 示例 + 部署脚本
 ├── config/
 │   └── config.example.json  # 配置模板(真实配置在 data/config.json,不入库)
 ├── data/                  # 运行时数据(gitignore):config.json / *cookie*.txt / *state*.json / logs/ / reports/
@@ -62,6 +62,25 @@ steam_items_trade/
 - 日志在 `data/logs/`，**按周命名**（`auto_log_<本周一>.txt`，如 `auto_log_2026-11-09.txt`），不是按天——找当天日期的文件会找不到；计划任务的控制台输出单独在 `auto_console.log`
 - 例行调度默认**不推微信**（`push_dispatch` 未开，避免刷屏）；只有事件型消息才响：待发货订单、收购命中、转 Steam 提醒、出口评估、cookie 失效。双击版额外发一条运行回执便于确认脚本确实跑了
 - 健康自检：`data/logs/auto_log_<周一>.txt` 应每 10 分钟出现一组「轮次开始 … 单轮模式结束」。若只有「轮次开始」没有结束行，说明该轮卡住；用任务计划程序看任务状态或用 `Get-ScheduledTaskInfo` 检查 `LastTaskResult`
+
+### 暂停 / 恢复 / 查看调度
+
+| 想做什么 | Windows（双击 `scripts/windows/` 下） | Linux（`scripts/linux/` 下） |
+|---|---|---|
+| **停止 10 分钟轮询** | `UUYP_stop.bat` | `./scheduler.sh stop` |
+| 恢复轮询 | `UUYP_start.bat` | `./scheduler.sh start` |
+| 查看状态 | `UUYP_status.bat` | `./scheduler.sh status` |
+| 重启一次 | PowerShell：`scheduler.ps1 -Action restart` | `./scheduler.sh restart` |
+
+**「停止」做了两件事**（只禁用任务不够）：
+1. `Disable-ScheduledTask`（Windows）/ 注释掉 crontab 行（Linux）→ 挡住后续触发，**可逆、不删任务**
+2. 结束**正在跑的那一轮**（精确匹配命令行含 `watcher_inv.py auto` 的 python 进程）——之前出现过单轮挂死 20 小时、后续轮次全被挡掉的情况
+
+`status` 会显示：任务启用状态、上次/下次运行时间、`LastTaskResult`、在跑轮次数量、以及 `auto_console.log` 尾部 6 行。Windows 侧若提示权限失败，右键「以管理员身份运行」bat。
+
+核心实现是 `scripts/windows/scheduler.ps1`（PowerShell，纯 ASCII）与 `scripts/linux/scheduler.sh`（bash），三个 bat 只是双击包装。任务名默认 `UUYP_auto`，可用 `scheduler.ps1 -TaskName <名字> -Action stop` 指定。
+
+> 注意区分：`notify_only=true` 是「照常轮询但不动资产」，这里的 stop 是「连轮询一起停」。两者互不影响。
 
 ### Linux
 
