@@ -160,7 +160,7 @@ steam_items_trade/
 
 ## Roadmap（未定稿，按优先级）
 
-1. **Phase A**：Steam 侧自动化（接报价/发报价/手机确认自动化/发货前自动撤 Steam 卖单）——蓝图见 `docs/research/Steam侧发货自动化调研` 与 `docs/reference/steampy`
+1. **Phase A**：Steam 侧自动化（接报价/发报价/手机确认自动化/发货前自动撤 Steam 卖单）——蓝图见 `docs/research/Steam侧发货自动化调研` 与 `docs/reference/steampy`；**所需凭据与获取方式见 `docs/CREDENTIALS.md`**
 2. **出口评估自动化**：目前三场地比较是推送+人工执行；后续接 BUFF 挂单/砸单 API（cookie 已具备），Steam 端依赖 Phase A
 3. **Steam cookie 双令牌自动续期**（steamRefresh 或 store 域长令牌，探索中）
 4. **个人成交数据回归**：记录每次买入的实际脱手天数，回校 min_turnover / min_bid_ask / spread_warn / hold_weeks
